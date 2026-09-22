@@ -1,0 +1,9 @@
+/data/
+/outputs/
+__pycache__/
+.venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+*.log
