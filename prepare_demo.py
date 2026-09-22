@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import joblib
+import shap
 
 from baseline import DATA, ROOT, make_features, read_data
 
@@ -130,11 +132,51 @@ def main() -> None:
     }
     (OUT / "demo.json").write_text(json.dumps(dataset, ensure_ascii=False), encoding="utf-8")
     print("Wrote outputs/demo.json", flush=True)
-    print("Preparing model features for customer sensitivity view", flush=True)
+    print("Preparing model features and probability-space SHAP explanations", flush=True)
     train_features, test_features = make_features(train, test)
     test_features.to_parquet(OUT / "test_features.parquet", index=False)
-    medians = {name: number(value) for name, value in train_features.median(numeric_only=True).items()}
-    (OUT / "feature_medians.json").write_text(json.dumps(medians), encoding="utf-8")
+    background = train_features.sample(n=min(100, len(train_features)), random_state=42)
+    background.to_parquet(OUT / "shap_background.parquet", index=False)
+    model = joblib.load(OUT / "model.joblib")
+    explainer = shap.TreeExplainer(model, background, feature_perturbation="interventional", model_output="probability")
+    sample = test_features.sample(n=min(300, len(test_features)), random_state=42)
+    explanation = explainer(sample)
+    values = np.asarray(explanation.values)
+    base = float(np.asarray(explanation.base_values).mean())
+    predicted = model.predict_proba(sample)[:, 1]
+    if not np.allclose(base + values.sum(axis=1), predicted, atol=1e-4):
+        raise ValueError("SHAP contributions do not reconstruct XGBoost probabilities")
+    mean_abs = np.mean(np.abs(values), axis=0)
+    order = np.argsort(mean_abs)[::-1]
+    importance = [{"feature": sample.columns[i], "mean_abs": float(mean_abs[i]),
+                   "mean_signed": float(values[:, i].mean())} for i in order]
+    beeswarm = {
+        sample.columns[i]: [{"value": number(value), "contribution": float(contribution)}
+                            for value, contribution in zip(sample.iloc[:100, i], values[:100, i])]
+        for i in order[:8]
+    }
+    cohort = {}
+    sampled_grades = test.iloc[sample.index].grade.reset_index(drop=True)
+    for grade in "ABCDEFG":
+        mask = sampled_grades.eq(grade).to_numpy()
+        if not mask.any():
+            continue
+        signed = values[mask].mean(axis=0)
+        ranked = np.argsort(np.abs(signed))[::-1][:6]
+        cohort[grade] = {"sample_rows": int(mask.sum()), "average_pd": float(predicted[mask].mean()),
+                         "contributors": [{"feature": sample.columns[i], "contribution": float(signed[i])} for i in ranked]}
+    high_mask = predicted >= .35
+    if high_mask.any():
+        signed = values[high_mask].mean(axis=0)
+        ranked = np.argsort(np.abs(signed))[::-1][:6]
+        cohort["high_risk"] = {"sample_rows": int(high_mask.sum()), "average_pd": float(predicted[high_mask].mean()),
+                               "contributors": [{"feature": sample.columns[i], "contribution": float(signed[i])} for i in ranked]}
+    (OUT / "shap_summary.json").write_text(json.dumps({
+        "method": "TreeExplainer / interventional / probability", "background_rows": len(background),
+        "sample_rows": len(sample), "base_probability": base, "feature_importance": importance,
+        "beeswarm": beeswarm, "cohorts": cohort,
+        "note": "SHAP 表示特征对当前模型预测的贡献，非因果关系；全局和客群结果来自测试集 A 的固定随机样本。",
+    }, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

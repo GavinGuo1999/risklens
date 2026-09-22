@@ -1,4 +1,4 @@
-"""Train a reproducible loan default baseline and write a Tianchi submission.
+"""Train comparable LR and XGBoost models and write a Tianchi submission.
 
 Usage: py baseline.py
        py baseline.py --sample-rows 20000 --max-iter 20 --output-dir outputs/smoke
@@ -17,9 +17,13 @@ os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 
 ROOT = Path(__file__).resolve().parent
@@ -78,7 +82,8 @@ def make_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-rows", type=int, help="Use a random training subset for a quick run")
-    parser.add_argument("--max-iter", type=int, default=150)
+    parser.add_argument("--max-iter", type=int, default=500, help="Maximum XGBoost boosting rounds")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs")
     args = parser.parse_args()
 
@@ -99,31 +104,34 @@ def main() -> None:
     fit_idx, valid_idx = train_test_split(
         np.arange(len(y)), test_size=0.2, random_state=42, stratify=y
     )
-    model = HistGradientBoostingClassifier(
-        max_iter=args.max_iter,
-        max_leaf_nodes=31,
-        learning_rate=0.06,
-        l2_regularization=1.0,
-        early_stopping=True,
-        random_state=42,
-    )
     print(f"Training on {len(fit_idx):,} rows; validating on {len(valid_idx):,} rows", flush=True)
-    model.fit(x.iloc[fit_idx], y.iloc[fit_idx])
-    valid_probability = model.predict_proba(x.iloc[valid_idx])[:, 1]
-    auc = roc_auc_score(y.iloc[valid_idx], valid_probability)
-    print(f"Validation AUC: {auc:.6f}; iterations: {model.n_iter_}", flush=True)
+    lr = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), LogisticRegression(max_iter=300, random_state=42))
+    lr.fit(x.iloc[fit_idx], y.iloc[fit_idx])
+    lr_probability = lr.predict_proba(x.iloc[valid_idx])[:, 1]
+    print(f"LR validation AUC: {roc_auc_score(y.iloc[valid_idx], lr_probability):.6f}", flush=True)
 
-    # Refit with all available labels, using the iteration count selected above.
-    final_model = HistGradientBoostingClassifier(
-        max_iter=model.n_iter_,
-        max_leaf_nodes=31,
-        learning_rate=0.06,
-        l2_regularization=1.0,
-        early_stopping=False,
-        random_state=42,
+    xgb_params = dict(
+        n_estimators=args.max_iter, max_depth=6, learning_rate=.05, subsample=.8,
+        colsample_bytree=.8, objective="binary:logistic", eval_metric="auc",
+        tree_method="hist", device=args.device, n_jobs=4, random_state=42,
+        enable_categorical=False,
     )
-    print(f"Refitting on all {len(y):,} training rows", flush=True)
-    final_model.fit(x, y)
+    inner_fit, stop_idx = train_test_split(fit_idx, test_size=.1, random_state=43, stratify=y.iloc[fit_idx])
+    tuner = XGBClassifier(**xgb_params, early_stopping_rounds=min(30, max(5, args.max_iter // 4)))
+    tuner.fit(x.iloc[inner_fit], y.iloc[inner_fit], eval_set=[(x.iloc[stop_idx], y.iloc[stop_idx])], verbose=False)
+    selected_rounds = int(tuner.best_iteration + 1)
+    # The reported holdout is never used for early stopping or parameter selection.
+    model = XGBClassifier(**(xgb_params | {"n_estimators": selected_rounds}))
+    model.fit(x.iloc[fit_idx], y.iloc[fit_idx], verbose=False)
+    valid_probability = model.predict_proba(x.iloc[valid_idx])[:, 1]
+    print(f"XGBoost validation AUC: {roc_auc_score(y.iloc[valid_idx], valid_probability):.6f}; rounds: {selected_rounds}", flush=True)
+
+    # Refit both models on the full labeled set after selecting XGBoost rounds on the holdout.
+    print(f"Refitting both models on all {len(y):,} training rows", flush=True)
+    final_lr = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), LogisticRegression(max_iter=300, random_state=42))
+    final_lr.fit(x, y)
+    final_model = XGBClassifier(**(xgb_params | {"n_estimators": selected_rounds}))
+    final_model.fit(x, y, verbose=False)
     submission = sample[["id"]].copy()
     submission["isDefault"] = final_model.predict_proba(x_test)[:, 1]
     if submission.isna().any().any() or not submission["isDefault"].between(0, 1).all():
@@ -136,14 +144,27 @@ def main() -> None:
         ["id", "isDefault", "grade", "term", "annualIncome", "loanAmnt", "interestRate", "dti", "ficoRangeLow", "issueDate"]
     ].copy()
     validation["probability"] = valid_probability
+    validation["lr_probability"] = lr_probability
     validation.to_csv(output_dir / "validation.csv", index=False)
     joblib.dump(final_model, output_dir / "model.joblib")
+    joblib.dump(final_lr, output_dir / "lr_model.joblib")
+
+    def score_report(probability: np.ndarray) -> dict:
+        truth = y.iloc[valid_idx]
+        fpr, tpr, _ = roc_curve(truth, probability)
+        return {"auc": float(roc_auc_score(truth, probability)), "ks": float(np.max(tpr - fpr)),
+                "pr_auc": float(average_precision_score(truth, probability)),
+                "brier": float(brier_score_loss(truth, probability))}
+
     report = {
         "train_rows": len(train),
         "test_rows": len(test),
         "feature_count": x.shape[1],
-        "validation_auc": auc,
-        "validation_iterations": model.n_iter_,
+        "validation_auc": float(roc_auc_score(y.iloc[valid_idx], valid_probability)),
+        "validation_iterations": selected_rounds,
+        "main_model": "XGBoost",
+        "models": {"Logistic Regression": score_report(lr_probability), "XGBoost": score_report(valid_probability)},
+        "device": args.device,
         "random_state": 42,
     }
     (output_dir / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

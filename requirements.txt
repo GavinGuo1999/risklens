@@ -6,3 +6,5 @@ uvicorn==0.33.0
 joblib==1.5.3
 pyarrow==23.0.0
 python-multipart==0.0.27
+xgboost==3.4.1
+shap==0.52.0

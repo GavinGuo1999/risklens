@@ -18,6 +18,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import shap
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -45,6 +46,14 @@ FEATURES = {
     "credit_history_years": {"label": "信用历史年数", "formula": "issueDate - earliesCreditLine", "description": "放款时已有的信用记录年限"},
     "issue_month": {"label": "放款月份", "formula": "month(issueDate)", "description": "从放款日期提取月份"},
     "installment_income_ratio": {"label": "月供收入比", "formula": "installment / (annualIncome / 12)", "description": "月供相对估算月收入的比例"},
+}
+BUSINESS_FEATURE_LABELS = {
+    "interestRate": "贷款利率", "dti": "债务收入比", "ficoRangeLow": "FICO 下限",
+    "grade": "信用等级", "subGrade": "细分信用等级", "loan_to_income": "贷款收入比",
+    "annualIncome": "年收入", "loanAmnt": "贷款金额", "credit_history_months": "信用历史",
+    "revolUtil": "循环额度利用率", "term": "贷款期限", "employmentLength": "工作年限",
+    "homeOwnership": "住房情况", "installment": "月供", "issue_year": "贷款发放年份",
+    "issue_month": "贷款发放月份",
 }
 
 
@@ -77,7 +86,41 @@ def customers() -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def model_and_features():
-    return (joblib.load(OUT / "model.joblib"), pd.read_parquet(OUT / "test_features.parquet"), json.loads((OUT / "feature_medians.json").read_text()))
+    return (joblib.load(OUT / "model.joblib"), joblib.load(OUT / "lr_model.joblib"),
+            pd.read_parquet(OUT / "test_features.parquet"))
+
+
+@lru_cache(maxsize=1)
+def shap_explainer():
+    model, _, _ = model_and_features()
+    background = pd.read_parquet(OUT / "shap_background.parquet")
+    return shap.TreeExplainer(model, background, feature_perturbation="interventional", model_output="probability")
+
+
+@lru_cache(maxsize=1)
+def shap_summary() -> dict:
+    return json.loads((OUT / "shap_summary.json").read_text(encoding="utf-8"))
+
+
+def explain_customer(position: int) -> dict:
+    model, lr, features = model_and_features()
+    sample = features.iloc[[position]]
+    explanation = shap_explainer()(sample)
+    contributions = np.asarray(explanation.values)[0]
+    base = float(np.asarray(explanation.base_values).reshape(-1)[0])
+    probability = float(model.predict_proba(sample)[0, 1])
+    reconstructed = base + float(contributions.sum())
+    if not np.isclose(reconstructed, probability, atol=1e-4):
+        raise HTTPException(500, "SHAP 解释与模型预测不一致")
+    rows = sorted([
+        {"feature": name, "value": None if pd.isna(sample.iloc[0][name]) else float(sample.iloc[0][name]),
+         "contribution": float(value)} for name, value in zip(features.columns, contributions)
+    ], key=lambda item: abs(item["contribution"]), reverse=True)
+    return {"base_probability": base, "prediction": probability,
+            "lr_probability": float(lr.predict_proba(sample)[0, 1]), "contributions": rows,
+            "method": "TreeExplainer / interventional / probability",
+            "background_rows": len(shap_explainer().data),
+            "note": "SHAP 反映特征对当前模型预测的贡献，不代表因果关系或独立的信贷决策依据。"}
 
 
 def thin_curve(x: np.ndarray, y: np.ndarray, limit: int = 120) -> list[dict]:
@@ -101,6 +144,7 @@ def evaluation() -> dict:
         "pr": thin_curve(recall[::-1], precision[::-1]),
         "calibration": thin_curve(cal_pred, cal_true, 10),
         "validation_rows": len(frame),
+        "brier": float(np.mean((score - truth) ** 2)),
     }
 
 
@@ -260,7 +304,16 @@ def feature_preview(name: str):
 def models():
     with jobs_lock:
         completed = [job.copy() for job in jobs.values() if job["status"] == "completed"]
-    return {"baseline": {"algorithm": "HistGradientBoosting", "scope": "80 万条训练 / 16 万条留出验证", **evaluation()}, "experiments": completed}
+    report = json.loads((OUT / "metrics.json").read_text(encoding="utf-8"))
+    return {"baseline": {"algorithm": "XGBoost", "scope": "同一 16 万条留出验证", **evaluation()},
+            "comparison": [{"algorithm": name, "purpose": "当前主模型" if name == "XGBoost" else "透明基准",
+                            **scores} for name, scores in report["models"].items()],
+            "selected_rounds": report["validation_iterations"], "experiments": completed}
+
+
+@app.get("/api/shap/global")
+def global_shap():
+    return shap_summary()
 
 
 class TrainingRequest(BaseModel):
@@ -333,18 +386,7 @@ def customer(customer_id: int):
     position = int(table.index.get_loc(customer_id))
     probability = float(row.probability)
     result = {"customer": {name: (None if pd.isna(value) else value.item() if hasattr(value, "item") else value) for name, value in row.items()}, "risk_level": "高" if probability >= .35 else "中" if probability >= .15 else "低"}
-    model, features, medians = model_and_features()
-    original = features.iloc[[position]].copy()
-    candidates = ["interestRate", "dti", "ficoRangeLow", "loan_to_income", "annualIncome", "loanAmnt", "credit_history_months", "revolUtil", "term"]
-    changed = pd.concat([original] * (len(candidates) + 1), ignore_index=True)
-    for i, feature in enumerate(candidates, start=1):
-        changed.loc[i, feature] = medians.get(feature)
-    predicted = model.predict_proba(changed)[:, 1]
-    result["sensitivity"] = sorted([
-        {"feature": feature, "value": None if pd.isna(original.iloc[0][feature]) else float(original.iloc[0][feature]), "reference": medians.get(feature), "delta": float(predicted[0] - predicted[i])}
-        for i, feature in enumerate(candidates, start=1)
-    ], key=lambda item: abs(item["delta"]), reverse=True)[:6]
-    result["explanation_method"] = "单变量替换敏感度：将该特征替换成训练集中位数，观察模型概率变化；不是 SHAP，也不表示因果关系。"
+    result["shap"] = explain_customer(position)
     return result
 
 
@@ -386,7 +428,7 @@ def analyst_evidence(question: str) -> tuple[str, dict, str, dict]:
         if not thresholds:
             thresholds = [.35]
         evidence = {"source": "16 万条有标签留出验证集", "scenarios": [threshold_metrics(value, 20000, 800) for value in thresholds]}
-        return "策略工具", evidence, "逐个阈值计算审核量、识别率、误伤率与假设成本", {"actions": [{"label": "打开策略模拟", "page": "threshold", "threshold": thresholds[-1]}]}
+        return "策略工具", evidence, "逐个阈值计算审核量、识别率、误伤率与假设成本", {"actions": [{"label": "打开策略模拟", "page": "strategy", "threshold": thresholds[-1]}]}
 
     customer_match = re.search(r"(?:客户|ID|#)\s*#?(\d{6,})", question, re.IGNORECASE)
     if customer_match:
@@ -394,9 +436,25 @@ def analyst_evidence(question: str) -> tuple[str, dict, str, dict]:
         table = customers()
         if identifier in table.index:
             row = table.loc[identifier]
-            local = f"客户 #{identifier} 的模型预测违约概率为 {row.probability:.2%}。可进入客户审查查看核心资料与风险线索；该概率不能直接作为审批决定。"
-            return "客户工具", {"source": "本地测试集 A", "customer_id": identifier, "probability": float(row.probability)}, "在本地按客户 ID 查询模型预测", {"local_answer": local, "actions": [{"label": "查看客户审查", "page": "customer", "customer_id": identifier}]}
+            explanation = explain_customer(int(table.index.get_loc(identifier)))
+            drivers = [x for x in explanation["contributions"] if x["contribution"] > 0 and x["feature"] in BUSINESS_FEATURE_LABELS][:3]
+            listed = "、".join(f"{BUSINESS_FEATURE_LABELS[x['feature']]} +{x['contribution']*100:.1f} 个百分点" for x in drivers)
+            local = f"客户 #{identifier} 的 XGBoost 预测违约概率为 {explanation['prediction']:.2%}。可解读字段的模型风险贡献：{listed or '未见明显上升项'}。匿名字段不推断业务含义；SHAP 不证明违约原因，最终由人工审核。"
+            evidence = {"source": "本地测试集 A / XGBoost / SHAP", "customer_id": identifier,
+                        "probability": explanation["prediction"], "base_probability": explanation["base_probability"],
+                        "top_contributors": drivers, "note": explanation["note"]}
+            return "客户预测 → SHAP 工具", evidence, "本地预测并计算概率空间 SHAP；单客户数据不发送在线模型", {"local_answer": local, "actions": [{"label": "查看风险解释", "page": "customer", "customer_id": identifier}]}
         return "客户工具", {"source": "本地测试集 A", "found": False}, "按客户 ID 查询", {"local_answer": "未在测试集 A 找到该客户 ID。"}
+
+    grade_reason = re.search(r"([A-G])\s*级", q)
+    if grade_reason and any(word in question for word in ["为什么", "驱动", "原因", "解释"]):
+        grade = grade_reason.group(1)
+        cohort = shap_summary()["cohorts"].get(grade)
+        if cohort:
+            evidence = {"source": "测试集 A 固定样本 / XGBoost / 概率空间 SHAP", "grade": grade,
+                        "cohort": cohort, "base_probability": shap_summary()["base_probability"],
+                        "caveat": shap_summary()["note"]}
+            return "客群 SHAP 工具", evidence, "聚合该等级抽样客户的平均 SHAP 模型贡献", {"actions": [{"label": "查看模型风险洞察", "page": "models"}]}
 
     grade_pair = re.search(r"([A-G])\s*[/、和及]\s*([A-G])\s*级?", q)
     grades = list(dict.fromkeys(grade_pair.groups())) if grade_pair else re.findall(r"([A-G])\s*级", q)
@@ -419,8 +477,10 @@ def analyst_evidence(question: str) -> tuple[str, dict, str, dict]:
 
     if any(word in question for word in ["为什么高风险", "高风险客户这么多", "风险因素", "风险原因"]):
         view = risk_overview_data()
-        evidence = {"source": "20 万条无标签测试集 A 的模型预测", "count": view["count"], "high_count": view["high_count"], "high_share": view["high_share"], "descriptive_factors": view["factors"], "caveat": view["basis"]}
-        return "组合风险工具", evidence, "汇总模型高风险占比与高风险组的特征中位数对照", {"actions": [{"label": "查看风险总览", "page": "overview"}]}
+        evidence = {"source": "20 万条无标签测试集 A 的模型预测 / 抽样 SHAP", "count": view["count"],
+                    "high_count": view["high_count"], "high_share": view["high_share"],
+                    "shap_cohort": shap_summary()["cohorts"].get("high_risk"), "caveat": shap_summary()["note"]}
+        return "组合风险 → SHAP 工具", evidence, "汇总风险占比与高风险抽样客户的平均模型贡献", {"actions": [{"label": "查看风险总览", "page": "overview"}]}
 
     if any(word in question for word in ["哪个客群", "风险最高", "最近"]):
         group = customers().groupby("grade").probability.agg(["size", "mean"]).sort_values("mean", ascending=False)
@@ -446,7 +506,7 @@ def call_deepseek(question: str, evidence: dict) -> str:
     payload = {
         "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
         "messages": [
-            {"role": "system", "content": "你是金融风控数据分析助手。只依据提供的聚合证据回答，使用中文，明确数据来源，百分比保留两位小数。local_examples_below 表示界面下方另有本地可点击客户示例，不要说无法列出名单，也不要编造 ID。不得编造其他数值、因果结论或线上表现；证据不足时明确说不知道。回答控制在150字以内。"},
+            {"role": "system", "content": "你是金融风控数据分析助手。只依据提供的聚合证据回答，使用中文，明确数据来源，百分比保留两位小数。SHAP 贡献表示对模型预测的推动或抵消，绝不能写成导致违约的原因，也不能编造特征贡献。local_examples_below 表示界面下方另有本地可点击客户示例，不要说无法列出名单，也不要编造 ID。不得编造其他数值、因果结论或线上表现；证据不足时明确说不知道。回答控制在150字以内。"},
             {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
         ],
         "temperature": 0.2,
