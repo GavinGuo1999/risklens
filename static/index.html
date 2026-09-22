@@ -3,30 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RiskLens · 金融智能风控分析</title>
+  <title>RiskLens · AI 信贷风险决策助手</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">R</span><span>RiskLens<small>金融智能风控分析</small></span></div>
-      <div class="nav-caption">工作台</div>
+      <div class="brand"><span class="brand-mark">R</span><span>RiskLens<small>AI 信贷风险决策助手</small></span></div>
+      <div class="nav-caption">业务工作台</div>
       <nav id="nav" aria-label="主导航"></nav>
-      <div class="sidebar-bottom"><div class="dataset-badge"><span class="pulse"></span> Tianchi Credit 531830</div><p>本地演示 · 原始记录保留本地<br>AI 问答发送问题与聚合指标</p></div>
+      <div class="sidebar-bottom"><div class="dataset-badge"><span class="pulse"></span> Tianchi Credit 531830</div><p>识别风险 · 解释线索 · 模拟策略<br>本地演示，不执行真实审批</p></div>
     </aside>
     <div class="main-area">
-      <header class="topbar"><div class="breadcrumb" id="breadcrumb">概览 / 风险驾驶舱</div><div class="top-actions"><span class="top-pill">● 数据已就绪</span><button class="analyst-toggle" id="analystToggle">✦ Ask RiskLens</button></div></header>
+      <header class="topbar"><div class="breadcrumb" id="breadcrumb">业务工作台 / 风险总览</div><div class="top-actions"><button class="status-button" id="modelStatus">● 输入分布：读取中</button><div class="advanced-wrap"><button class="secondary" id="advancedToggle" aria-expanded="false">高级 / 模型与数据 ▾</button><div class="advanced-menu" id="advancedMenu" hidden><button data-advanced="models">模型表现与实验</button><button data-advanced="data">数据质量</button><button data-advanced="features">特征管理</button><button data-advanced="monitor">模型健康 / PSI</button></div></div></div></header>
       <main id="content" tabindex="-1"><div class="loading">正在读取演示数据…</div></main>
     </div>
   </div>
-  <div class="analyst-backdrop" id="analystBackdrop"></div>
-  <section class="analyst-panel" id="analystPanel" aria-label="AI Risk Analyst">
-    <div class="analyst-head"><div><span class="eyebrow">AI RISK ANALYST</span><h2>向 RiskLens 提问</h2></div><button class="icon-button" id="analystClose" aria-label="关闭">×</button></div>
-    <p class="muted">先计算数据证据，再交由 DeepSeek 总结。回答仅供演示分析。</p>
-    <div class="suggestions"><button data-question="D级客户的历史违约率是多少？">D 级违约率</button><button data-question="哪些特征出现了分布漂移？">特征漂移</button><button data-question="阈值0.35会误伤多少正常客户？">阈值影响</button></div>
-    <div id="analystAnswer" class="analyst-answer"><div class="empty">选择示例问题，或输入你关心的风控问题。</div></div>
-    <form id="analystForm" class="analyst-form"><input id="analystQuestion" maxlength="500" placeholder="例如：D 级客户的历史违约率？" required><button class="primary" type="submit">发送</button></form>
-  </section>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

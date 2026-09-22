@@ -116,9 +116,76 @@ def threshold_metrics(threshold: float, bad_cost: float, good_cost: float) -> di
         "threshold": threshold, "flagged": tp + fp, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
         "precision": tp / (tp + fp) if tp + fp else 0,
         "recall": tp / (tp + fn) if tp + fn else 0,
+        "false_reject_rate": fp / (fp + tn) if fp + tn else 0,
         "estimated_cost": fn * bad_cost + fp * good_cost,
         "bad_cost": bad_cost, "good_cost": good_cost,
         "basis": "16 万条留出验证集；成本为输入假设，不代表真实贷款损失",
+    }
+
+
+def risk_level(score: pd.Series) -> pd.Series:
+    return pd.cut(score, [-np.inf, .15, .35, np.inf], labels=["低风险", "中风险", "高风险"], right=False)
+
+
+def filter_customers(grade: str = "all", purpose: str = "all", income: str = "all", risk: str = "all") -> pd.DataFrame:
+    if grade not in {"all", "A", "B", "C", "D", "E", "F", "G"} or risk not in {"all", "low", "medium", "high"}:
+        raise HTTPException(422, "无效的等级或风险筛选")
+    if income not in {"all", "low", "middle", "high"}:
+        raise HTTPException(422, "无效的收入筛选")
+    table = customers()
+    if purpose != "all":
+        if not purpose.isdigit() or int(purpose) not in table.purpose.unique():
+            raise HTTPException(422, "无效的贷款用途编码")
+        table = table[table.purpose.eq(int(purpose))]
+    if grade != "all":
+        table = table[table.grade.eq(grade)]
+    if income == "low":
+        table = table[table.annualIncome.le(60000)]
+    elif income == "middle":
+        table = table[table.annualIncome.gt(60000) & table.annualIncome.le(120000)]
+    elif income == "high":
+        table = table[table.annualIncome.gt(120000)]
+    if risk != "all":
+        level = risk_level(table.probability)
+        table = table[level.eq({"low": "低风险", "medium": "中风险", "high": "高风险"}[risk])]
+    return table
+
+
+def risk_clues(row: pd.Series) -> list[str]:
+    clues = []
+    if row.interestRate >= 18:
+        clues.append("利率较高")
+    if row.dti >= 30:
+        clues.append("债务收入比较高")
+    if row.ficoRangeLow < 670:
+        clues.append("信用评分偏低")
+    if row.annualIncome > 0 and row.loanAmnt / row.annualIncome >= .5:
+        clues.append("贷款收入比较高")
+    if row.grade in {"D", "E", "F", "G"}:
+        clues.append("信用等级偏低")
+    return clues[:2] or ["查看客户详情"]
+
+
+def risk_overview_data(grade: str = "all", purpose: str = "all", income: str = "all", risk: str = "all") -> dict:
+    table = filter_customers(grade, purpose, income, risk)
+    reference = filter_customers(grade, purpose, income, "all")
+    distribution = risk_level(table.probability).value_counts().reindex(["低风险", "中风险", "高风险"], fill_value=0)
+    high = table[table.probability.ge(.35)]
+    factors = []
+    labels = {"interestRate": "贷款利率", "dti": "债务收入比", "ficoRangeLow": "FICO 下限", "annualIncome": "年收入"}
+    if len(high):
+        for column, label in labels.items():
+            factors.append({"label": label, "high_median": float(high[column].median()), "population_median": float(reference[column].median())})
+    top = []
+    for row in table.nlargest(10, "probability").itertuples():
+        top.append({"id": int(row.id), "probability": float(row.probability), "grade": row.grade, "clues": risk_clues(row)})
+    return {
+        "count": len(table), "high_count": int(distribution["高风险"]), "medium_count": int(distribution["中风险"]),
+        "high_share": float(distribution["高风险"] / len(table)) if len(table) else 0,
+        "distribution": {name: int(count) for name, count in distribution.items()},
+        "factors": factors, "top_customers": top, "threshold": .35,
+        "filter": {"grade": grade, "purpose": purpose, "income": income, "risk": risk},
+        "basis": "测试集 A 的模型预测；风险线索与组间中位数是描述性对照，不是 SHAP 或因果归因。",
     }
 
 
@@ -138,6 +205,16 @@ def static_file(filename: str):
 def overview():
     d = demo()
     return {key: d[key] for key in ["train_rows", "test_rows", "column_count", "default_rate", "missing_cells", "duplicate_rows", "high_risk_count", "risk_distribution"]} | {"evaluation": evaluation(), "drift": d["drift"][:4]}
+
+
+@app.get("/api/risk-overview")
+def risk_overview(grade: str = "all", purpose: str = "all", income: str = "all", risk: str = "all"):
+    return risk_overview_data(grade, purpose, income, risk)
+
+
+@app.get("/api/risk-filters")
+def risk_filters():
+    return {"purposes": [int(value) for value in sorted(customers().purpose.dropna().unique())]}
 
 
 @app.get("/api/columns")
@@ -301,18 +378,65 @@ class AnalystRequest(BaseModel):
     question: str = Field(min_length=2, max_length=500)
 
 
-def analyst_evidence(question: str) -> tuple[str, dict, str]:
-    match = re.search(r"([A-Ga-g])\s*级|grade\s*([A-Ga-g])", question, re.IGNORECASE)
+def analyst_evidence(question: str) -> tuple[str, dict, str, dict]:
+    q = question.upper()
+    if any(word in question for word in ["阈值", "误伤", "漏掉", "成本", "审核策略"]):
+        values = re.findall(r"(?<!\d)(?:0?\.\d+|1\.0+)(?!\d)", question)
+        thresholds = [float(value) for value in values[:2] if 0 <= float(value) <= 1]
+        if not thresholds:
+            thresholds = [.35]
+        evidence = {"source": "16 万条有标签留出验证集", "scenarios": [threshold_metrics(value, 20000, 800) for value in thresholds]}
+        return "策略工具", evidence, "逐个阈值计算审核量、识别率、误伤率与假设成本", {"actions": [{"label": "打开策略模拟", "page": "threshold", "threshold": thresholds[-1]}]}
+
+    customer_match = re.search(r"(?:客户|ID|#)\s*#?(\d{6,})", question, re.IGNORECASE)
+    if customer_match:
+        identifier = int(customer_match.group(1))
+        table = customers()
+        if identifier in table.index:
+            row = table.loc[identifier]
+            local = f"客户 #{identifier} 的模型预测违约概率为 {row.probability:.2%}。可进入客户审查查看核心资料与风险线索；该概率不能直接作为审批决定。"
+            return "客户工具", {"source": "本地测试集 A", "customer_id": identifier, "probability": float(row.probability)}, "在本地按客户 ID 查询模型预测", {"local_answer": local, "actions": [{"label": "查看客户审查", "page": "customer", "customer_id": identifier}]}
+        return "客户工具", {"source": "本地测试集 A", "found": False}, "按客户 ID 查询", {"local_answer": "未在测试集 A 找到该客户 ID。"}
+
+    grade_pair = re.search(r"([A-G])\s*[/、和及]\s*([A-G])\s*级?", q)
+    grades = list(dict.fromkeys(grade_pair.groups())) if grade_pair else re.findall(r"([A-G])\s*级", q)
+    if not grades:
+        grade_match = re.search(r"GRADE\s*([A-G])", q)
+        grades = [grade_match.group(1)] if grade_match else []
+    pd_match = re.search(r"(?:PD|违约概率)\s*(?:>|＞|大于|超过)\s*(0?\.\d+)", q)
+    if pd_match or (len(grades) > 1 and any(word in question for word in ["筛", "找", "客户"])):
+        cutoff = float(pd_match.group(1)) if pd_match else .35
+        if not 0 <= cutoff <= 1:
+            return "客群工具", {"error": "PD 阈值应在 0 到 1 之间"}, "检查筛选条件", {"local_answer": "PD 阈值应在 0 到 1 之间。"}
+        table = customers()
+        filtered = table[table.probability.gt(cutoff)]
+        if grades:
+            filtered = filtered[filtered.grade.isin(grades)]
+        summary = filtered.groupby("grade").probability.agg(["size", "mean"])
+        evidence = {"source": "20 万条无标签测试集 A 的模型预测", "grades": grades or "全部", "pd_above": cutoff, "count": len(filtered), "local_examples_below": min(10, len(filtered)), "by_grade": [{"grade": str(index), "count": int(row["size"]), "average_pd": float(row["mean"])} for index, row in summary.iterrows()]}
+        matches = [{"id": int(row.id), "grade": row.grade, "probability": float(row.probability)} for row in filtered.nlargest(10, "probability").itertuples()]
+        return "客群工具", evidence, "按信用等级与模型预测概率筛选测试集 A", {"matches": matches, "actions": [{"label": "查看风险总览", "page": "overview"}]}
+
+    if any(word in question for word in ["为什么高风险", "高风险客户这么多", "风险因素", "风险原因"]):
+        view = risk_overview_data()
+        evidence = {"source": "20 万条无标签测试集 A 的模型预测", "count": view["count"], "high_count": view["high_count"], "high_share": view["high_share"], "descriptive_factors": view["factors"], "caveat": view["basis"]}
+        return "组合风险工具", evidence, "汇总模型高风险占比与高风险组的特征中位数对照", {"actions": [{"label": "查看风险总览", "page": "overview"}]}
+
+    if any(word in question for word in ["哪个客群", "风险最高", "最近"]):
+        group = customers().groupby("grade").probability.agg(["size", "mean"]).sort_values("mean", ascending=False)
+        evidence = {"source": "20 万条无标签测试集 A 的模型预测", "groups": [{"grade": str(index), "count": int(row["size"]), "average_pd": float(row["mean"])} for index, row in group.iterrows()], "caveat": "没有新近生产数据和测试集真实标签，不能判断最近风险变化。"}
+        return "客群工具", evidence, "按信用等级比较测试集 A 的模型平均风险", {"actions": [{"label": "查看风险总览", "page": "overview"}]}
+
+    match = re.search(r"([A-G])\s*级|GRADE\s*([A-G])", q)
     if match:
         grade = (match.group(1) or match.group(2)).upper()
         item = next((row for row in demo()["groups"]["grade"] if row["label"] == grade), None)
         if item:
-            return "客群查询", {"source": "80 万条有标签训练集", "grade": item, "overall_default_rate": demo()["default_rate"]}, "从训练集按 grade 分组，计算样本量与历史违约率"
-    if any(word in question for word in ["漂移", "稳定", "PSI", "psi"]):
-        return "分布漂移", {"source": "80 万训练集 vs 20 万无标签测试集 A", "drift": demo()["drift"]}, "对训练集与测试集 A 的输入变量计算 PSI"
-    if any(word in question for word in ["阈值", "误伤", "漏掉", "成本"]):
-        return "阈值模拟", {"source": "16 万条有标签留出验证集", **threshold_metrics(.35, 20000, 800)}, "在留出验证集上计算 TP、FP、FN、TN 和假设成本"
-    return "整体概览", {"source": "训练集标签与留出验证结果", "training_rows": demo()["train_rows"], "default_rate": demo()["default_rate"], "validation_auc": evaluation()["auc"], "grade": demo()["groups"]["grade"][:7]}, "汇总训练标签、留出验证 AUC 与等级分组"
+            return "客群工具", {"source": "80 万条有标签训练集", "grade": item, "overall_default_rate": demo()["default_rate"]}, "按信用等级计算历史样本量与违约率", {"actions": [{"label": "查看风险总览", "page": "overview", "grade": grade}]}
+    if any(word in question for word in ["漂移", "稳定", "PSI", "psi", "模型状态"]):
+        return "模型健康工具", {"source": "80 万训练集 vs 20 万无标签测试集 A", "drift": demo()["drift"]}, "比较输入变量分布 PSI", {"actions": [{"label": "查看模型健康", "page": "monitor"}]}
+    view = risk_overview_data()
+    return "组合风险工具", {"source": "20 万条无标签测试集 A 的模型预测", "count": view["count"], "distribution": view["distribution"], "high_share": view["high_share"]}, "汇总当前模型风险分层", {"actions": [{"label": "查看风险总览", "page": "overview"}]}
 
 
 def call_deepseek(question: str, evidence: dict) -> str:
@@ -322,7 +446,7 @@ def call_deepseek(question: str, evidence: dict) -> str:
     payload = {
         "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
         "messages": [
-            {"role": "system", "content": "你是金融风控数据分析助手。只依据提供的聚合证据回答，使用中文，明确数据来源，百分比保留两位小数。不得编造数值、因果结论或线上表现；证据不足时明确说不知道。回答控制在150字以内。"},
+            {"role": "system", "content": "你是金融风控数据分析助手。只依据提供的聚合证据回答，使用中文，明确数据来源，百分比保留两位小数。local_examples_below 表示界面下方另有本地可点击客户示例，不要说无法列出名单，也不要编造 ID。不得编造其他数值、因果结论或线上表现；证据不足时明确说不知道。回答控制在150字以内。"},
             {"role": "user", "content": json.dumps({"question": question, "evidence": evidence}, ensure_ascii=False)},
         ],
         "temperature": 0.2,
@@ -345,14 +469,17 @@ def call_deepseek(question: str, evidence: dict) -> str:
 
 @app.post("/api/analyst")
 async def analyst(request: AnalystRequest):
-    route, evidence, calculation = analyst_evidence(request.question)
-    try:
-        answer = await asyncio.to_thread(call_deepseek, request.question, evidence)
-        mode = "deepseek"
-    except RuntimeError as exc:
-        answer = f"已完成本地指标查询；在线总结暂不可用（{exc}）。请查看下方证据。"
-        mode = "evidence_only"
-    return {"answer": answer, "mode": mode, "route": route, "calculation": calculation, "evidence": evidence}
+    route, evidence, calculation, ui = analyst_evidence(request.question)
+    if "local_answer" in ui:
+        answer, mode = ui["local_answer"], "local_only"
+    else:
+        try:
+            answer = await asyncio.to_thread(call_deepseek, request.question, evidence)
+            mode = "deepseek"
+        except RuntimeError as exc:
+            answer = f"已完成本地指标查询；在线总结暂不可用（{exc}）。请查看下方证据。"
+            mode = "evidence_only"
+    return {"answer": answer, "mode": mode, "route": route, "calculation": calculation, "evidence": evidence, "actions": ui.get("actions", []), "matches": ui.get("matches", [])}
 
 
 @app.post("/api/upload-preview")
